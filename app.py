@@ -1,7 +1,5 @@
 import os
 import logging
-import asyncio
-import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 import anthropic
@@ -21,52 +19,161 @@ PORT              = int(os.environ.get("PORT", 5000))
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app = Flask(__name__)
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ── MARKET DATA ───────────────────────────────────────────────────────────────
 
-def get_session() -> str:
-    """Return trading session based on UK time."""
-    hour = datetime.utcnow().hour  # UTC; adjust +1 for BST if needed
+def get_live_gold_price() -> dict:
+    """Fetch live gold price from multiple free sources."""
+    # Try Metals.live (free, no key needed)
+    try:
+        r = requests.get("https://metals.live/api/spot", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            for item in data:
+                if item.get("symbol") == "XAU":
+                    price = item.get("price", 0)
+                    change = item.get("change", 0)
+                    change_pct = item.get("percentChange", 0)
+                    return {
+                        "price": round(price, 2),
+                        "change": round(change, 2),
+                        "change_pct": round(change_pct, 2),
+                        "source": "live"
+                    }
+    except Exception as e:
+        log.warning(f"metals.live failed: {e}")
+
+    # Fallback: frankfurter (USD/XAU rates)
+    try:
+        r = requests.get("https://api.frankfurter.app/latest?from=XAU&to=USD", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            price = data["rates"]["USD"]
+            return {
+                "price": round(price, 2),
+                "change": 0,
+                "change_pct": 0,
+                "source": "frankfurter"
+            }
+    except Exception as e:
+        log.warning(f"frankfurter failed: {e}")
+
+    return {"price": 0, "change": 0, "change_pct": 0, "source": "unavailable"}
+
+
+def get_session_and_context() -> dict:
+    """Return trading session, day info, and market context."""
+    now  = datetime.utcnow()
+    hour = now.hour
+    dow  = now.strftime("%A")  # Monday, Tuesday etc
+    date = now.strftime("%B %d, %Y")
+
+    # Session
     if 7 <= hour < 9:
-        return "London Open 🇬🇧 — highest volatility window"
-    elif 12 <= hour < 16:
-        return "New York Session 🇺🇸 — major liquidity period"
+        session = "London Open 🇬🇧"
+        session_note = "highest volatility window, institutional orders flooding in"
+    elif 12 <= hour < 17:
+        session = "New York Session 🇺🇸"
+        session_note = "major liquidity period, US data drives price"
+    elif 8 <= hour < 13:
+        session = "London/NY Overlap ⚡"
+        session_note = "peak volume window, strongest moves of the day occur here"
     elif 2 <= hour < 6:
-        return "Asian Session 🌏 — typically quieter, range-bound"
+        session = "Asian Session 🌏"
+        session_note = "typically quieter, range-bound price action"
     else:
-        return "London/NY Overlap ⚡ — peak volume period"
+        session = "Off-Peak Hours"
+        session_note = "lower liquidity, wider spreads possible"
+
+    # Day context
+    day_notes = {
+        "Monday":    "start of week, market finding direction after weekend gaps",
+        "Tuesday":   "mid-week momentum building, follow-through from Monday",
+        "Wednesday": "mid-week, often choppy as traders await Thursday/Friday data",
+        "Thursday":  "key data day, US jobless claims often impact gold",
+        "Friday":    "end of week, traders closing positions — liquidity drops into close",
+        "Saturday":  "weekend — markets closed, low volume",
+        "Sunday":    "market opening, gap risk from weekend news"
+    }
+
+    # US market holiday check (major ones that affect gold)
+    us_holidays = {
+        "January 01":   "New Year's Day — US markets closed, thin liquidity",
+        "July 04":      "US Independence Day — US markets closed, thin liquidity",
+        "November 28":  "US Thanksgiving — US markets closed, thin liquidity",
+        "December 25":  "Christmas Day — US markets closed, thin liquidity",
+        "June 19":      "US Juneteenth — US markets closed, thin liquidity expected",
+        "January 20":   "US MLK Day — US markets closed",
+        "February 17":  "US Presidents Day — US markets closed",
+        "May 26":       "US Memorial Day — US markets closed",
+        "September 01": "US Labor Day — US markets closed",
+        "November 11":  "US Veterans Day — US markets closed",
+    }
+
+    today_key = now.strftime("%B %d")
+    holiday   = us_holidays.get(today_key, None)
+
+    return {
+        "session":      session,
+        "session_note": session_note,
+        "day":          dow,
+        "day_note":     day_notes.get(dow, ""),
+        "date":         date,
+        "holiday":      holiday,
+        "hour_utc":     hour
+    }
 
 
 def generate_analysis(direction: str, pair: str, entry: float) -> str:
-    """Call Anthropic API and return a 3-line signal analysis."""
+    """Call Anthropic API with real market data and return analysis."""
 
-    session = get_session()
-    now     = datetime.utcnow().strftime("%A %H:%M UTC")
+    # Get live data
+    gold_data = get_live_gold_price()
+    ctx       = get_session_and_context()
 
-    prompt = f"""You are a professional gold and forex trading analyst for a signals service called Kevin's Gold Signals.
+    live_price   = gold_data["price"]
+    price_change = gold_data["change"]
+    change_pct   = gold_data["change_pct"]
 
-A new {direction} signal has just fired on {pair}.
+    # Build price context string
+    if live_price > 0:
+        direction_emoji = "📈" if price_change >= 0 else "📉"
+        price_context = f"Live gold price: ${live_price} ({direction_emoji} {price_change:+.2f} / {change_pct:+.2f}% today)"
+    else:
+        price_context = f"Signal entry price: ${entry}"
 
-Details:
-- Direction: {direction}
-- Entry price: {entry}
-- Time: {now}
-- Session: {session}
+    # Build holiday warning
+    holiday_note = ""
+    if ctx["holiday"]:
+        holiday_note = f"\n⚠️ IMPORTANT: {ctx['holiday']} — factor this into the analysis, warn about thin liquidity."
 
-Write a SHORT 2-3 line analysis explaining WHY this signal makes sense RIGHT NOW.
+    prompt = f"""You are a sharp, professional gold trading analyst for "Kevin's Gold Signals" — a premium Telegram signals service with 90+ active clients.
+
+A {direction} signal has just fired on {pair}.
+
+REAL MARKET DATA RIGHT NOW:
+- {price_context}
+- Session: {ctx['session']} — {ctx['session_note']}
+- Day: {ctx['day']}, {ctx['date']} — {ctx['day_note']}
+- Signal entry: ${entry}{holiday_note}
+
+Write a 2-3 sentence analysis that:
+1. References the ACTUAL current price and what it's doing TODAY
+2. Mentions the session and why timing makes sense (or warns if it doesn't)
+3. If there's a holiday or thin liquidity — mention it as a caution
+4. Ends with ONE short punchy line (risk management, discipline, let it run etc)
+
 Rules:
-- Maximum 3 sentences
-- Sound professional but easy to understand for retail traders
-- Reference the session, price action, and momentum
-- Do NOT use hashtags
-- Do NOT say "I" or "we"
-- End with one short motivational line like "Manage risk. Let it run. 💰"
-- Vary your wording every time — never repeat the same phrases
+- Sound like a real trader, not a robot
+- Maximum 3 sentences + 1 closing line
+- No hashtags, no "I" or "we"
+- Vary wording every time — never repeat phrases
+- Be specific to TODAY's conditions, not generic
 
-Return ONLY the analysis text. Nothing else."""
+Return ONLY the analysis. Nothing else."""
 
     message = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=150,
+        max_tokens=180,
         messages=[{"role": "user", "content": prompt}]
     )
 
@@ -104,7 +211,7 @@ def analyse():
     {
         "direction": "BUY",
         "pair":      "XAUUSD",
-        "entry":     2318.50
+        "entry":     4155.50
     }
     """
     try:
@@ -121,11 +228,11 @@ def analyse():
         if entry <= 0:
             return jsonify({"error": "entry price required"}), 400
 
-        # Generate AI analysis
+        # Generate AI analysis with live data
         analysis = generate_analysis(direction, pair, entry)
-        log.info(f"Analysis: {analysis}")
+        log.info(f"Analysis generated: {analysis}")
 
-        # Format and send to Telegram
+        # Format Telegram message
         emoji = "🟢" if direction == "BUY" else "🔴"
         message = (
             f"{emoji} <b>{direction} SIGNAL — {pair}</b>\n"
